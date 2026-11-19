@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import sys
+import sysconfig
+from threading import Barrier
+import warnings
+
+import pytest
 from rosbag2_py import LocalMessageDefinitionSource
 
 
@@ -144,3 +152,45 @@ def test_local_message_definition_source_can_resolve_msg_with_idl_deps():
         '  };\n'
         '};\n'
     )
+
+
+@pytest.mark.skipif(not sysconfig.get_config_var('Py_GIL_DISABLED'), reason='requires FT Python')
+def test_message_definition_module_keeps_free_threading():
+    path = sys.modules[LocalMessageDefinitionSource.__module__].__file__
+    probe = """
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+
+assert sys.flags.gil is None and not sys._is_gil_enabled()
+spec = spec_from_file_location('_message_definitions', sys.argv[1])
+module = module_from_spec(spec)
+spec.loader.exec_module(module)
+assert not sys._is_gil_enabled()
+assert module.LocalMessageDefinitionSource() is not None
+"""
+    subprocess.run([sys.executable, '-I', '-c', probe, path], check=True, timeout=30)
+
+
+def test_shared_message_definition_source():
+    message_types = ('rosbag2_test_msgdefs/ComplexMsg', 'rosbag2_test_msgdefs/msg/ComplexIdl')
+    source = LocalMessageDefinitionSource()
+    ready = Barrier(8, timeout=30)
+
+    def read(worker):
+        message = message_types[worker % len(message_types)]
+        ready.wait()
+        for _ in range(24):
+            result = source.get_full_text_ext(message, '/parallel')
+            assert result.encoding in ('ros2msg', 'ros2idl')
+            assert 'rosbag2_test_msgdefs' in result.encoded_message_definition
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(read, range(8)))
+
+
+def test_message_definition_deprecation_error_is_preserved():
+    source = LocalMessageDefinitionSource()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', DeprecationWarning)
+        with pytest.raises(DeprecationWarning, match='get_full_text_ext'):
+            source.get_full_text('rosbag2_test_msgdefs/ComplexMsg')

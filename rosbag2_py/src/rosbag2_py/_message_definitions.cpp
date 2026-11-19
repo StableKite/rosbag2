@@ -12,21 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
+#include <string>
+
 #include "rosbag2_cpp/message_definitions/local_message_definition_source.hpp"
 
 #include "./pybind11.hpp"
 
-PYBIND11_MODULE(_message_definitions, m) {
+namespace
+{
+
+class LocalMessageDefinitionSource
+{
+public:
+  rosbag2_storage::MessageDefinition get_full_text_ext(
+    const std::string & root_type, const std::string & topic_name)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return source_.get_full_text_ext(root_type, topic_name);
+  }
+
+private:
+  // The native source lazily populates its message and action lookup tables.
+  std::mutex mutex_;
+  rosbag2_cpp::LocalMessageDefinitionSource source_;
+};
+
+}  // namespace
+
+PYBIND11_MODULE(_message_definitions, m, pybind11::mod_gil_not_used()) {
   m.doc() = "Python wrapper of the rosbag2_cpp message definitions API";
 
-  pybind11::class_<rosbag2_cpp::LocalMessageDefinitionSource>(
+  pybind11::class_<LocalMessageDefinitionSource>(
     m, "LocalMessageDefinitionSource")
   .def(pybind11::init<>())
   .def(
     "get_full_text",
-    [](rosbag2_cpp::LocalMessageDefinitionSource & self, const std::string & root_type) {
-      PyErr_WarnEx(PyExc_DeprecationWarning,
-        "get_full_text() is deprecated, use get_full_text_ext() instead.", 1);
+    [](LocalMessageDefinitionSource & self, const std::string & root_type) {
+      if (PyErr_WarnEx(PyExc_DeprecationWarning,
+        "get_full_text() is deprecated, use get_full_text_ext() instead.", 1) < 0)
+      {
+        throw pybind11::error_already_set();
+      }
+      pybind11::gil_scoped_release release;
       return self.get_full_text_ext(root_type, "");
     },
     pybind11::arg("root_type"),
@@ -34,5 +62,6 @@ PYBIND11_MODULE(_message_definitions, m) {
     " topic name)"
   )
   .def(
-    "get_full_text_ext", &rosbag2_cpp::LocalMessageDefinitionSource::get_full_text_ext);
+    "get_full_text_ext", &LocalMessageDefinitionSource::get_full_text_ext,
+    pybind11::call_guard<pybind11::gil_scoped_release>());
 }
