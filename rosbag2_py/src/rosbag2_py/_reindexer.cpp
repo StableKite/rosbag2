@@ -20,9 +20,7 @@
 //
 // This notice must appear in all copies of this file and its derivatives.
 
-#include <memory>
-#include <string>
-#include <vector>
+#include <mutex>
 
 #include "rosbag2_cpp/reindexer.hpp"
 #include "rosbag2_storage/storage_options.hpp"
@@ -35,22 +33,22 @@ namespace rosbag2_py
 class Reindexer
 {
 public:
-  Reindexer()
-  : reindexer_(std::make_unique<rosbag2_cpp::Reindexer>())
-  {
-  }
-
   void reindex(const rosbag2_storage::StorageOptions & storage_options)
   {
-    reindexer_->reindex(storage_options);
+    const auto options = storage_options;
+    pybind11::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mutex_);
+    // The native reindexer transfers its storage factory to a reader on each run.
+    rosbag2_cpp::Reindexer reindexer;
+    reindexer.reindex(options);
   }
 
-protected:
-  std::unique_ptr<rosbag2_cpp::Reindexer> reindexer_;
+private:
+  std::mutex mutex_;
 };
 }  // namespace rosbag2_py
 
-PYBIND11_MODULE(_reindexer, m) {
+PYBIND11_MODULE(_reindexer, m, pybind11::mod_gil_not_used()) {
   m.doc() = "Python wrapper of the rosbag2_cpp reindexer API";
 
   pybind11::class_<rosbag2_py::Reindexer>(
