@@ -65,5 +65,5 @@ class TestRos2BagInfo(unittest.TestCase):
         arguments = ['info', '--topic-name', bag_path.as_posix()]
         with self.launch_bag_command(arguments=arguments) as bag_command:
             bag_command.wait_for_shutdown(timeout=5)
-        assert normalize_lineseps(bag_command.output) == EXPECTED_OUTPUT, \
+        assert normalize_lineseps(bag_command.stdout) == EXPECTED_OUTPUT, \
             'ros2bag CLI did not produce the expected output'
