@@ -29,6 +29,7 @@
 #include "rosbag2_storage/storage_options.hpp"
 #include "rosbag2_storage/topic_metadata.hpp"
 
+#include "./compression_options.hpp"
 #include "./pybind11.hpp"
 
 namespace rosbag2_py
@@ -146,7 +147,10 @@ PYBIND11_MODULE(_writer, m) {
   ;
 
   pybind11::class_<PyCompressionWriter>(m, "SequentialCompressionWriter")
-  .def(pybind11::init<rosbag2_compression::CompressionOptions>())
+  .def(
+    pybind11::init([](const rosbag2_py::CompressionOptions & options) {
+      return std::make_unique<PyCompressionWriter>(options.snapshot());
+    }))
   .def(
     "open",
     pybind11::overload_cast<

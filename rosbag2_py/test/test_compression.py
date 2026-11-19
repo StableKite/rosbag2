@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import os
+import subprocess
+import sys
+import sysconfig
 
 from common import get_rosbag_options
 
@@ -60,6 +63,44 @@ def test_compression_options():
     assert compression_options.compression_mode == CompressionMode.MESSAGE
     assert compression_options.compression_queue_size == 0
     assert compression_options.compression_threads == 8
+
+
+@pytest.mark.skipif(not sysconfig.get_config_var('Py_GIL_DISABLED'), reason='requires FT Python')
+def test_free_threaded_compression_options():
+    """Exercise one shared Python options object with the default GIL policy."""
+    path = sys.modules[CompressionOptions.__module__].__file__
+    probe = """
+from concurrent.futures import ThreadPoolExecutor
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+from threading import Barrier
+
+assert sys.flags.gil is None and not sys._is_gil_enabled()
+spec = spec_from_file_location('_compression_options', sys.argv[1])
+module = module_from_spec(spec)
+spec.loader.exec_module(module)
+assert not sys._is_gil_enabled()
+
+formats = {str(i) * 4096 for i in range(8)}
+options = module.CompressionOptions(min(formats))
+ready = Barrier(8, timeout=30)
+
+def update(worker):
+    ready.wait()
+    value = str(worker) * 4096
+    for _ in range(200):
+        options.compression_format = value
+        assert options.compression_format in formats
+        options.compression_threads = worker
+        assert 0 <= options.compression_threads < 8
+        assert (module.compression_mode_from_string('message')
+                == module.CompressionMode.MESSAGE)
+
+with ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(update, range(8)))
+assert not sys._is_gil_enabled()
+"""
+    subprocess.run([sys.executable, '-I', '-c', probe, path], check=True, timeout=90)
 
 
 @pytest.mark.parametrize('storage_id', TESTED_STORAGE_IDS)
