@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import subprocess
+import sys
+import sysconfig
 import unittest
 
 import common  # noqa
@@ -30,6 +34,64 @@ from rosbag2_py import (
 
 
 class TestStorageStructs(unittest.TestCase):
+    def test_metadata_views_survive_replacement(self):
+        topic = TopicMetadata(0, 'original', 'std_msgs/msg/String', 'cdr')
+        info = TopicInformation(topic, 1)
+        bag = BagMetadata(topics_with_message_count=[info])
+        view = bag.topics_with_message_count[0]
+        assert view is bag.topics_with_message_count[0]
+        view.topic_metadata.name = 'changed'
+        assert bag.topics_with_message_count[0].topic_metadata.name == 'changed'
+
+        topic_view = view.topic_metadata
+        view.topic_metadata = topic
+        assert topic_view is view.topic_metadata
+        assert topic_view.name == 'original'
+        bag.topics_with_message_count = []
+        assert view.topic_metadata.name == 'original'
+        assert bag.topics_with_message_count == []
+
+    @unittest.skipUnless(sysconfig.get_config_var('Py_GIL_DISABLED'), 'needs free-threaded Python')
+    def test_read_and_write_bag_without_gil(self):
+        environment = dict(os.environ)
+        environment.pop('PYTHON_GIL', None)
+        subprocess.run([sys.executable, '-c', """
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+
+assert sys.flags.gil is None and not sys._is_gil_enabled()
+import rosbag2_py as bag
+from rclpy.serialization import deserialize_message, serialize_message
+from std_msgs.msg import String
+
+with TemporaryDirectory() as directory, ThreadPoolExecutor(max_workers=8) as pool:
+    storage = bag.StorageOptions(uri=str(Path(directory) / 'bag'), storage_id='sqlite3')
+    converter = bag.ConverterOptions('cdr', 'cdr')
+    writer = bag.SequentialWriter()
+    writer.open(storage, converter)
+    writer.create_topic(bag.TopicMetadata(0, 'topic', 'std_msgs/msg/String', 'cdr'))
+
+    def write(i):
+        writer.write('topic', serialize_message(String(data=str(i))), i)
+
+    list(pool.map(write, range(64)))
+    writer.close()
+    reader = bag.SequentialReader()
+    reader.open(storage, converter)
+
+    def read(_):
+        topic, message, stamp, _ = reader.read_next_ext()
+        assert topic == 'topic' and deserialize_message(message, String).data == str(stamp)
+        return stamp
+
+    assert sorted(pool.map(read, range(64))) == list(range(64))
+    assert not reader.has_next()
+    reader.close()
+assert not sys._is_gil_enabled()
+"""], env=environment, timeout=30, check=True)
+
 
     def test_bag_metadata_default_ctor(self):
         metadata = BagMetadata()

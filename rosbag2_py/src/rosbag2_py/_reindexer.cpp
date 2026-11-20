@@ -26,6 +26,7 @@
 #include "rosbag2_storage/storage_options.hpp"
 
 #include "./pybind11.hpp"
+#include "value_properties.hpp"
 
 namespace rosbag2_py
 {
@@ -35,7 +36,7 @@ class Reindexer
 public:
   void reindex(const rosbag2_storage::StorageOptions & storage_options)
   {
-    const auto options = storage_options;
+    const auto options = value_snapshot(storage_options);
     pybind11::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mutex_);
     // The native reindexer transfers its storage factory to a reader on each run.

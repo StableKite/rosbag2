@@ -13,11 +13,16 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <atomic>
 #include <csignal>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -35,12 +40,19 @@
 #include "rclcpp/executors/events_cbg_executor/events_cbg_executor.hpp"
 
 #include "./pybind11.hpp"
+#include "value_properties.hpp"
 
 namespace py = pybind11;
 typedef std::unordered_map<std::string, rclcpp::QoS> QoSMap;
 
 namespace
 {
+
+using rosbag2_py::read_field;
+using rosbag2_py::value_mutex;
+using rosbag2_py::value_snapshot;
+using rosbag2_py::value_snapshots;
+using rosbag2_py::write_field;
 
 class Arguments
 {
@@ -74,8 +86,7 @@ private:
 
 rclcpp::QoS qos_from_handle(const py::handle source)
 {
-  PyObject * raw_obj = PyObject_CallMethod(source.ptr(), "get_c_qos_profile", "");
-  const auto py_obj = py::cast<py::object>(raw_obj);
+  const auto py_obj = source.attr("get_c_qos_profile")();
   const auto rmw_qos_profile = py_obj.cast<rmw_qos_profile_t>();
   const auto qos_init = rclcpp::QoSInitialization::from_rmw(rmw_qos_profile);
   return rclcpp::QoS{qos_init, rmw_qos_profile};
@@ -83,8 +94,13 @@ rclcpp::QoS qos_from_handle(const py::handle source)
 
 QoSMap qos_map_from_py_dict(const py::dict & dict)
 {
+  auto * copy = PyDict_Copy(dict.ptr());
+  if (!copy) {
+    throw py::error_already_set();
+  }
+  auto snapshot = py::reinterpret_steal<py::dict>(copy);
   QoSMap value;
-  for (const auto & item : dict) {
+  for (const auto & item : snapshot) {
     auto key = std::string(py::str(item.first));
     value.insert({key, qos_from_handle(item.second)});
   }
@@ -100,62 +116,214 @@ struct OptionsWrapper : public T
 public:
   void setDelay(double delay)
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     this->delay = rclcpp::Duration::from_nanoseconds(
       static_cast<rcl_duration_value_t>(RCUTILS_S_TO_NS(delay)));
   }
 
   double getPlaybackDuration() const
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     return RCUTILS_NS_TO_S(static_cast<double>(this->playback_duration.nanoseconds()));
   }
 
   void setPlaybackDuration(double playback_duration)
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     this->playback_duration = rclcpp::Duration::from_nanoseconds(
       static_cast<rcl_duration_value_t>(RCUTILS_S_TO_NS(playback_duration)));
   }
 
   double getDelay() const
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     return RCUTILS_NS_TO_S(static_cast<double>(this->delay.nanoseconds()));
   }
 
   void setStartOffset(double start_offset)
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     this->start_offset = static_cast<rcutils_time_point_value_t>(RCUTILS_S_TO_NS(start_offset));
   }
 
   double getStartOffset() const
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     return RCUTILS_NS_TO_S(static_cast<double>(this->start_offset));
   }
 
   void setPlaybackUntilTimestamp(int64_t playback_until_timestamp)
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     this->playback_until_timestamp =
       static_cast<rcutils_time_point_value_t>(playback_until_timestamp);
   }
 
   int64_t getPlaybackUntilTimestamp() const
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     return this->playback_until_timestamp;
   }
 
   void setTopicQoSProfileOverrides(const py::dict & overrides)
   {
-    py_dict = overrides;
-    this->topic_qos_profile_overrides = qos_map_from_py_dict(overrides);
+    auto profiles = qos_map_from_py_dict(overrides);
+    py::dict previous = overrides;
+    std::lock_guard<std::mutex> lock(value_mutex());
+    std::swap(py_dict, previous);
+    this->topic_qos_profile_overrides = std::move(profiles);
   }
 
-  const py::dict & getTopicQoSProfileOverrides() const
+  py::dict getTopicQoSProfileOverrides() const
   {
+    std::lock_guard<std::mutex> lock(value_mutex());
     return py_dict;
+  }
+
+  T snapshot() const
+  {
+    return value_snapshot(static_cast<const T &>(*this));
   }
 
   py::dict py_dict;
 };
 typedef OptionsWrapper<rosbag2_transport::PlayOptions> PlayOptions;
 typedef OptionsWrapper<rosbag2_transport::RecordOptions> RecordOptions;
+
+template<typename Binding, typename Value, typename Member>
+void bind_field(py::class_<Binding> & binding, const char * name, Member Value::* field)
+{
+  binding.def_property(name, read_field<Binding>(field), write_field<Binding>(field));
+}
+
+rosbag2_transport::RecordOptions recording_options(RecordOptions & options)
+{
+  bool deprecated = false;
+  auto snapshot = [&]() {
+      std::lock_guard<std::mutex> lock(value_mutex());
+      if (options.output_serialization_format.empty() && !options.rmw_serialization_format.empty()) {
+        options.output_serialization_format = options.rmw_serialization_format;
+        deprecated = true;
+      }
+      return static_cast<const rosbag2_transport::RecordOptions &>(options);
+    }();
+  if (deprecated && PyErr_WarnEx(PyExc_DeprecationWarning,
+    "The rmw_serialization_format option is deprecated and will be removed in a "
+    "future release.\nPlease use output_serialization_format instead.", 1) < 0)
+  {
+    throw py::error_already_set();
+  }
+  if (snapshot.output_serialization_format.empty()) {
+    const char * format = rmw_get_serialization_format();
+    if (!format) {
+      throw std::runtime_error("RMW serialization format is unavailable");
+    }
+    snapshot.output_serialization_format = format;
+    std::lock_guard<std::mutex> lock(value_mutex());
+    if (options.output_serialization_format.empty()) {
+      options.output_serialization_format = format;
+    }
+  }
+  return snapshot;
+}
+
+class LegacySignals
+{
+public:
+  LegacySignals()
+  : lease_(mutex_, std::try_to_lock)
+  {
+    if (!lease_) {
+      throw std::runtime_error("Another blocking rosbag2 operation is already handling signals");
+    }
+    received_.store(0, std::memory_order_relaxed);
+    old_int_ = std::signal(SIGINT, receive);
+    old_term_ = std::signal(SIGTERM, receive);
+    if (old_int_ == SIG_ERR || old_term_ == SIG_ERR) {
+      restore();
+      throw std::runtime_error("Could not install rosbag2 signal handlers");
+    }
+  }
+
+  ~LegacySignals()
+  {
+    if (lease_) {
+      restore();
+    }
+  }
+
+  static bool pending() noexcept
+  {
+    return received_.load(std::memory_order_relaxed) != 0;
+  }
+
+  void forward()
+  {
+    const auto sig = received_.load(std::memory_order_relaxed);
+    const auto handler = sig == SIGINT ? old_int_ : old_term_;
+    restore();
+    lease_.unlock();
+    if (sig != 0 && handler != SIG_ERR && handler != SIG_IGN && handler != SIG_DFL) {
+      handler(sig);
+    }
+  }
+
+private:
+  using Handler = void (*)(int);
+
+  static void receive(int sig) noexcept
+  {
+    received_.store(sig, std::memory_order_relaxed);
+  }
+
+  void restore() noexcept
+  {
+    if (old_int_ != SIG_ERR) {
+      std::signal(SIGINT, old_int_);
+    }
+    if (old_term_ != SIG_ERR) {
+      std::signal(SIGTERM, old_term_);
+    }
+  }
+
+  inline static std::mutex mutex_;
+  // The signal handler must not enter Python, allocate, or notify a condition variable.
+  static_assert(std::atomic<int>::is_always_lock_free);
+  inline static std::atomic<int> received_{0};
+  std::unique_lock<std::mutex> lease_;
+  Handler old_int_{SIG_ERR};
+  Handler old_term_{SIG_ERR};
+};
+
+class LegacyStop
+{
+public:
+  void reset()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    requested_ = false;
+  }
+
+  void request()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    requested_ = true;
+    ready_.notify_all();
+  }
+
+  void wait()
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!requested_ && !LegacySignals::pending()) {
+      ready_.wait_for(lock, std::chrono::milliseconds(100));
+    }
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  bool requested_{false};
+};
 
 }  // namespace
 
@@ -165,14 +333,13 @@ namespace rosbag2_py
 class Player
 {
 public:
-  using SignalHandlerType = void (*)(int);
-
   // TODO(christophebedard): remove this constructor after a deprecation period
   // along with the `if (!player_)` checks in the methods
   explicit Player(const std::string & log_level = "info")
   {
     Arguments arguments({"--ros-args", "--log-level", log_level});
     rclcpp::init(arguments.argc(), arguments.argv());
+    legacy_stop_.reset();
     // Intentionally not initializing player_ here, because default constructor is intended to be
     // used for the composable node only since it will call Player::Play() inside. Also it will
     // fail without specifying storage options with valid path to the bag file via ros args.
@@ -184,12 +351,11 @@ public:
     const std::string & log_level,
     const std::string & node_name)
   : Player(
-      std::vector<rosbag2_storage::StorageOptions>({storage_options}), play_options, log_level,
-      node_name) {}
+      {value_snapshot(storage_options)}, play_options.snapshot(), log_level, node_name) {}
 
   Player(
     const std::vector<rosbag2_storage::StorageOptions> & storage_options,
-    const PlayOptions & play_options,
+    const rosbag2_transport::PlayOptions & play_options,
     const std::string & log_level,
     const std::string & node_name)
   {
@@ -206,6 +372,7 @@ public:
     try {
       player_ =
         std::make_shared<rosbag2_transport::Player>(storage_options, play_options, node_name);
+      legacy_stop_.reset();
     } catch (...) {
       rclcpp::shutdown();
       throw;
@@ -221,16 +388,13 @@ public:
   void start_spin()
   {
     std::lock_guard<std::mutex> lock(spin_thread_mutex_);
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
+    auto player = configured_player();
     if (exec_) {
       // We already have an executor spinning
       return;
     }
     exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
-    exec_->add_node(player_);
+    exec_->add_node(player);
     spin_thread_ = std::thread(
       [this]() {
         exec_->spin();
@@ -249,143 +413,111 @@ public:
       if (spin_thread_.joinable()) {
         spin_thread_.join();
       }
-      exec_->remove_node(player_);
+      exec_->remove_node(configured_player());
       exec_ = nullptr;
     }
   }
 
   void play()
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    player_->play();
+    auto player = configured_player();
+    player->play();
   }
 
   bool wait_for_playback_to_start(double timeout = -1.0)
   {
+    auto player = configured_player();
     return wait_for_async(
       timeout,
-      [&](double timeout) {
-        return player_->wait_for_playback_to_start(std::chrono::duration<double>(timeout));
+      [player](double timeout) {
+        return player->wait_for_playback_to_start(std::chrono::duration<double>(timeout));
       });
   }
 
   bool wait_for_playback_to_start_exclusively(double timeout = -1.0)
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-                               "storage and play options.");
-    }
-    return player_->wait_for_playback_to_start(std::chrono::duration<double>(timeout));
+    return configured_player()->wait_for_playback_to_start(std::chrono::duration<double>(timeout));
   }
 
   bool wait_for_playback_to_finish(double timeout = -1.0)
   {
+    auto player = configured_player();
     return wait_for_async(
       timeout,
-      [&](double timeout) {
-        return player_->wait_for_playback_to_finish(std::chrono::duration<double>(timeout));
+      [player](double timeout) {
+        return player->wait_for_playback_to_finish(std::chrono::duration<double>(timeout));
       });
   }
 
   bool wait_for_playback_to_finish_exclusively(double timeout = -1.0)
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-                               "storage and play options.");
-    }
-    return player_->wait_for_playback_to_finish(std::chrono::duration<double>(timeout));
+    return configured_player()->wait_for_playback_to_finish(std::chrono::duration<double>(timeout));
   }
 
   void stop()
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    player_->stop();
+    auto player = configured_player();
+    player->stop();
   }
 
   void pause()
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    player_->pause();
+    auto player = configured_player();
+    player->pause();
   }
 
   void resume()
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    player_->resume();
+    auto player = configured_player();
+    player->resume();
   }
 
   [[nodiscard]] bool is_paused() const
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    return player_->is_paused();
+    auto player = configured_player();
+    return player->is_paused();
   }
 
   [[nodiscard]] int64_t get_starting_time() const
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    return player_->get_starting_time();
+    auto player = configured_player();
+    return player->get_starting_time();
   }
 
   [[nodiscard]] int64_t get_playback_duration() const
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    return player_->get_playback_duration();
+    auto player = configured_player();
+    return player->get_playback_duration();
   }
 
   bool play_next()
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    return player_->play_next();
+    auto player = configured_player();
+    std::lock_guard<std::mutex> lock(step_mutex_);
+    return player->play_next();
   }
 
   size_t burst(size_t num_messages)
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    return player_->burst(num_messages);
+    auto player = configured_player();
+    std::lock_guard<std::mutex> lock(step_mutex_);
+    return player->burst(num_messages);
   }
 
   void seek(int64_t time_point)
   {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    player_->seek(static_cast<rcutils_time_point_value_t>(time_point));
+    auto player = configured_player();
+    player->seek(static_cast<rcutils_time_point_value_t>(time_point));
   }
 
   static void cancel()
   {
-    PyErr_WarnEx(PyExc_DeprecationWarning,
-                 "Player.cancel() is deprecated. Please use Player.stop() instead.", 1);
-    exit_ = true;
-    wait_for_exit_cv_.notify_all();
+    if (PyErr_WarnEx(PyExc_DeprecationWarning,
+      "Player.cancel() is deprecated. Please use Player.stop() instead.", 1) < 0)
+    {
+      throw py::error_already_set();
+    }
+    legacy_stop_.request();
   }
 
   // TODO(christophebedard): remove this method after a deprecation period
@@ -393,17 +525,21 @@ public:
     const rosbag2_storage::StorageOptions & storage_options,
     PlayOptions & play_options)
   {
-    player_ = std::make_shared<rosbag2_transport::Player>(storage_options, play_options);
-    play_impl(false);
+    LegacySignals signals;
+    replace_player(std::make_shared<rosbag2_transport::Player>(
+      value_snapshot(storage_options), play_options.snapshot()));
+    play_impl(signals);
   }
 
   // TODO(christophebedard): remove this method after a deprecation period
   void play(
-    const std::vector<rosbag2_storage::StorageOptions> & storage_options,
+    const std::vector<py::object> & storage_options,
     PlayOptions & play_options)
   {
-    player_ = std::make_shared<rosbag2_transport::Player>(storage_options, play_options);
-    play_impl(false);
+    LegacySignals signals;
+    replace_player(std::make_shared<rosbag2_transport::Player>(
+      value_snapshots<rosbag2_storage::StorageOptions>(storage_options), play_options.snapshot()));
+    play_impl(signals);
   }
 
   // TODO(christophebedard): remove this method after a deprecation period
@@ -412,18 +548,34 @@ public:
     PlayOptions & play_options,
     size_t num_messages)
   {
-    player_ = std::make_shared<rosbag2_transport::Player>(storage_options, play_options);
-    play_impl(true, num_messages);
+    LegacySignals signals;
+    replace_player(std::make_shared<rosbag2_transport::Player>(
+      value_snapshot(storage_options), play_options.snapshot()));
+    play_impl(signals, true, num_messages);
   }
 
 protected:
-  bool wait_for_async(double timeout, const std::function<bool(double)> & wait_for_function)
+  std::shared_ptr<rosbag2_transport::Player> configured_player() const
   {
+    std::lock_guard<std::mutex> lock(node_mutex_);
     if (!player_) {
       throw std::runtime_error("Player is not initialized. Please use constructor with "
         "storage and play options.");
     }
+    return player_;
+  }
 
+  void replace_player(std::shared_ptr<rosbag2_transport::Player> player)
+  {
+    std::scoped_lock lock(spin_thread_mutex_, node_mutex_);
+    if (exec_) {
+      throw std::runtime_error("Stop the Player executor before replacing its configuration");
+    }
+    player_.swap(player);
+  }
+
+  bool wait_for_async(double timeout, const std::function<bool(double)> & wait_for_function)
+  {
     const double wait_period =
       (timeout < 0.0) ? SIGNAL_CHECK_INTERVAL : std::min(timeout, SIGNAL_CHECK_INTERVAL);
 
@@ -462,123 +614,68 @@ protected:
     return finished;
   }
 
-  static void signal_handler(int sig_num)
+  void play_impl(LegacySignals & signals, bool burst = false, size_t burst_num_messages = 0)
   {
-    if (sig_num == SIGINT || sig_num == SIGTERM) {
-      deferred_sig_number_ = sig_num;
-      rosbag2_py::Player::cancel();
-    }
-  }
-
-  static void install_signal_handlers()
-  {
-    deferred_sig_number_ = -1;
-    old_sigterm_handler_ = std::signal(SIGTERM, &rosbag2_py::Player::signal_handler);
-    old_sigint_handler_ = std::signal(SIGINT, &rosbag2_py::Player::signal_handler);
-  }
-
-  static void uninstall_signal_handlers()
-  {
-    if (old_sigterm_handler_ != SIG_ERR) {
-      std::signal(SIGTERM, old_sigterm_handler_);
-      old_sigterm_handler_ = SIG_ERR;
-    }
-    if (old_sigint_handler_ != SIG_ERR) {
-      std::signal(SIGINT, old_sigint_handler_);
-      old_sigint_handler_ = SIG_ERR;
-    }
-    deferred_sig_number_ = -1;
-  }
-
-  static void process_deferred_signal()
-  {
-    auto call_signal_handler = [](const SignalHandlerType & signal_handler, int sig_num) {
-        if (signal_handler != SIG_ERR && signal_handler != SIG_IGN && signal_handler != SIG_DFL) {
-          signal_handler(sig_num);
-        }
-      };
-
-    if (deferred_sig_number_ == SIGINT) {
-      call_signal_handler(old_sigint_handler_, deferred_sig_number_);
-    } else if (deferred_sig_number_ == SIGTERM) {
-      call_signal_handler(old_sigterm_handler_, deferred_sig_number_);
-    }
-  }
-
-  void play_impl(bool burst = false, size_t burst_num_messages = 0)
-  {
-    if (!player_) {
-      throw std::runtime_error("Player is not initialized. Please use constructor with "
-        "storage and play options.");
-    }
-    install_signal_handlers();
+    auto player = configured_player();
+    std::thread wait_for_exit;
+    std::exception_ptr failure;
+    std::exception_ptr stop_failure;
     try {
-      exit_ = false;
       start_spin();
-      player_->play();
-
-      auto wait_for_exit_thread = std::thread(
-        [this]() {
-          std::unique_lock<std::mutex> lock(wait_for_exit_mutex_);
-          wait_for_exit_cv_.wait(lock, [] {return rosbag2_py::Player::exit_.load();});
-          player_->stop();
+      player->play();
+      wait_for_exit = std::thread(
+        [player, &stop_failure]() {
+          legacy_stop_.wait();
+          try {
+            player->stop();
+          } catch (...) {
+            stop_failure = std::current_exception();
+          }
         });
       {
-        // Release the GIL for long-running play, so that calling Python code
-        // can use other threads
         py::gil_scoped_release release;
         if (burst) {
-          player_->burst(burst_num_messages);
+          std::lock_guard<std::mutex> lock(step_mutex_);
+          player->burst(burst_num_messages);
         }
-        player_->wait_for_playback_to_finish();
+        player->wait_for_playback_to_finish();
       }
-
-      rosbag2_py::Player::cancel();  // Need to trigger exit from wait_for_exit_thread
-      if (wait_for_exit_thread.joinable()) {
-        wait_for_exit_thread.join();
-      }
-
-      stop_spin();
     } catch (...) {
-      process_deferred_signal();
-      uninstall_signal_handlers();
-      throw;
+      failure = std::current_exception();
     }
-    process_deferred_signal();
-    uninstall_signal_handlers();
+    legacy_stop_.request();
+    if (wait_for_exit.joinable()) {
+      wait_for_exit.join();
+    }
+    legacy_stop_.reset();
+    stop_spin();
+    signals.forward();
+    if (failure || stop_failure) {
+      std::rethrow_exception(failure ? failure : stop_failure);
+    }
   }
 
-  static std::atomic_bool exit_;
-  static std::condition_variable wait_for_exit_cv_;
-  static SignalHandlerType old_sigint_handler_;
-  static SignalHandlerType old_sigterm_handler_;
-  static int deferred_sig_number_;
+  inline static LegacyStop legacy_stop_;
   static constexpr double SIGNAL_CHECK_INTERVAL = 0.1;
-  std::mutex wait_for_exit_mutex_;
 
   std::shared_ptr<rosbag2_transport::Player> player_;
+  mutable std::mutex node_mutex_;
+  std::mutex step_mutex_;
   std::mutex spin_thread_mutex_;
   std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> exec_{nullptr};
   std::thread spin_thread_;
 };
 
-Player::SignalHandlerType Player::old_sigint_handler_ {SIG_ERR};
-Player::SignalHandlerType Player::old_sigterm_handler_ {SIG_ERR};
-int Player::deferred_sig_number_{-1};
-std::atomic_bool Player::exit_{false};
-std::condition_variable Player::wait_for_exit_cv_{};
-
 class Recorder
 {
 public:
-  using SignalHandlerType = void (*)(int);
-
   // TODO(christophebedard): remove this constructor after a deprecation period
   // along with the `if (!recorder_)` checks in the methods
   explicit Recorder(const std::string & log_level = "info")
   {
     Arguments arguments({"--ros-args", "--log-level", log_level});
     rclcpp::init(arguments.argc(), arguments.argv());
+    legacy_stop_.reset();
     // Intentionally not initializing recorder_ here, because default constructor is intended to be
     // used for the composable node only since it will call Recorder::record() inside.
   }
@@ -597,23 +694,12 @@ public:
     // See the Player constructor: if constructing the Recorder throws, shut the
     // Context down here so it is not left to be destroyed at process exit.
     try {
-      if (!record_options.rmw_serialization_format.empty() &&
-        record_options.output_serialization_format.empty())
-      {
-        record_options.output_serialization_format = record_options.rmw_serialization_format;
-        PyErr_WarnEx(PyExc_DeprecationWarning,
-                     "The rmw_serialization_format option is deprecated and will be removed in a "
-                     "future release.\nPlease use output_serialization_format instead.",
-                     1
-        );
-      }
-      if (record_options.output_serialization_format.empty()) {
-        record_options.output_serialization_format = std::string(rmw_get_serialization_format());
-      }
-      auto writer = rosbag2_transport::ReaderWriterFactory::make_writer(record_options);
+      auto recording = recording_options(record_options);
+      auto writer = rosbag2_transport::ReaderWriterFactory::make_writer(recording);
 
       recorder_ = std::make_shared<rosbag2_transport::Recorder>(
-        std::move(writer), storage_options, record_options, node_name);
+        std::move(writer), value_snapshot(storage_options), recording, node_name);
+      legacy_stop_.reset();
     } catch (...) {
       rclcpp::shutdown();
       throw;
@@ -629,17 +715,14 @@ public:
   void start_spin()
   {
     std::lock_guard<std::mutex> lock(spin_thread_mutex_);
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
+    auto recorder = configured_recorder();
     if (exec_) {
       // We already have an executor spinning
       return;
     }
     exec_ = std::make_unique<rclcpp::executors::EventsCBGExecutor>(
       rclcpp::ExecutorOptions(), 1);
-    exec_->add_node(recorder_);
+    exec_->add_node(recorder);
     spin_thread_ = std::thread(
       [this]() {
         exec_->spin();
@@ -658,54 +741,39 @@ public:
       if (spin_thread_.joinable()) {
         spin_thread_.join();
       }
-      exec_->remove_node(recorder_);
+      exec_->remove_node(configured_recorder());
       exec_ = nullptr;
     }
   }
 
   void record()
   {
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
-    recorder_->record();
+    auto recorder = configured_recorder();
+    recorder->record();
   }
 
   void stop()
   {
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
-    recorder_->stop();
+    auto recorder = configured_recorder();
+    recorder->stop();
   }
 
   void pause()
   {
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
-    recorder_->pause();
+    auto recorder = configured_recorder();
+    recorder->pause();
   }
 
   void resume()
   {
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
-    recorder_->resume();
+    auto recorder = configured_recorder();
+    recorder->resume();
   }
 
   bool is_paused()
   {
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
-    return recorder_->is_paused();
+    auto recorder = configured_recorder();
+    return recorder->is_paused();
   }
 
   // TODO(christophebedard): remove this method after a deprecation period
@@ -714,37 +782,22 @@ public:
     RecordOptions & record_options,
     const std::string & node_name)
   {
-    if (!record_options.rmw_serialization_format.empty() &&
-      record_options.output_serialization_format.empty())
-    {
-      record_options.output_serialization_format = record_options.rmw_serialization_format;
-      PyErr_WarnEx(PyExc_DeprecationWarning,
-                   "The rmw_serialization_format option is deprecated and will be removed in a "
-                   "future release.\nPlease use output_serialization_format instead.",
-                   1
-      );
-    }
-    if (record_options.output_serialization_format.empty()) {
-      record_options.output_serialization_format = std::string(rmw_get_serialization_format());
-    }
-    auto writer = rosbag2_transport::ReaderWriterFactory::make_writer(record_options);
+    LegacySignals signals;
+    auto recording = recording_options(record_options);
+    auto writer = rosbag2_transport::ReaderWriterFactory::make_writer(recording);
 
-    recorder_ = std::make_shared<rosbag2_transport::Recorder>(
-      std::move(writer), storage_options, record_options, node_name);
+    replace_recorder(std::make_shared<rosbag2_transport::Recorder>(
+      std::move(writer), value_snapshot(storage_options), recording, node_name));
 
-    record_impl();
+    record_impl(signals);
   }
 
-  void record_impl()
+  void record_impl(LegacySignals & signals)
   {
-    if (!recorder_) {
-      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
-        "storage and record options.");
-    }
-    install_signal_handlers();
+    auto recorder = configured_recorder();
+    std::exception_ptr failure;
     try {
-      exit_ = false;
-      recorder_->record();
+      recorder->record();
       // Run exec->spin() in a separate thread, because we need to call exec->cancel() after
       // recorder->stop() to be able to send notifications about bag split and close.
       start_spin();
@@ -752,91 +805,58 @@ public:
         // Release the GIL for long-running record, so that calling Python code
         // can use other threads
         py::gil_scoped_release release;
-        std::unique_lock<std::mutex> lock(wait_for_exit_mutex_);
-        wait_for_exit_cv_.wait(lock, [] {return rosbag2_py::Recorder::exit_.load();});
-        recorder_->stop();
+        legacy_stop_.wait();
+        recorder->stop();
       }
-
-      stop_spin();
     } catch (...) {
-      process_deferred_signal();
-      uninstall_signal_handlers();
-      throw;
+      failure = std::current_exception();
     }
-    process_deferred_signal();
-    uninstall_signal_handlers();
+    legacy_stop_.reset();
+    stop_spin();
+    signals.forward();
+    if (failure) {
+      std::rethrow_exception(failure);
+    }
   }
 
   static void cancel()
   {
-    PyErr_WarnEx(PyExc_DeprecationWarning,
-                 "Recorder.cancel() is deprecated. Please use Recorder.stop() instead.", 1);
-    exit_ = true;
-    wait_for_exit_cv_.notify_all();
+    if (PyErr_WarnEx(PyExc_DeprecationWarning,
+      "Recorder.cancel() is deprecated. Please use Recorder.stop() instead.", 1) < 0)
+    {
+      throw py::error_already_set();
+    }
+    legacy_stop_.request();
   }
 
 protected:
-  static void signal_handler(int sig_num)
+  std::shared_ptr<rosbag2_transport::Recorder> configured_recorder() const
   {
-    if (sig_num == SIGINT || sig_num == SIGTERM) {
-      deferred_sig_number_ = sig_num;
-      rosbag2_py::Recorder::cancel();
+    std::lock_guard<std::mutex> lock(node_mutex_);
+    if (!recorder_) {
+      throw std::runtime_error("Recorder is not initialized. Please use constructor with "
+        "storage and record options.");
     }
+    return recorder_;
   }
 
-  static void install_signal_handlers()
+  void replace_recorder(std::shared_ptr<rosbag2_transport::Recorder> recorder)
   {
-    deferred_sig_number_ = -1;
-    old_sigterm_handler_ = std::signal(SIGTERM, &rosbag2_py::Recorder::signal_handler);
-    old_sigint_handler_ = std::signal(SIGINT, &rosbag2_py::Recorder::signal_handler);
+    std::scoped_lock lock(spin_thread_mutex_, node_mutex_);
+    if (exec_) {
+      throw std::runtime_error("Stop the Recorder executor before replacing its configuration");
+    }
+    recorder_.swap(recorder);
   }
 
-  static void uninstall_signal_handlers()
-  {
-    if (old_sigterm_handler_ != SIG_ERR) {
-      std::signal(SIGTERM, old_sigterm_handler_);
-      old_sigterm_handler_ = SIG_ERR;
-    }
-    if (old_sigint_handler_ != SIG_ERR) {
-      std::signal(SIGINT, old_sigint_handler_);
-      old_sigint_handler_ = SIG_ERR;
-    }
-    deferred_sig_number_ = -1;
-  }
-
-  static void process_deferred_signal()
-  {
-    auto call_signal_handler = [](const SignalHandlerType & signal_handler, int sig_num) {
-        if (signal_handler != SIG_ERR && signal_handler != SIG_IGN && signal_handler != SIG_DFL) {
-          signal_handler(sig_num);
-        }
-      };
-
-    if (deferred_sig_number_ == SIGINT) {
-      call_signal_handler(old_sigint_handler_, deferred_sig_number_);
-    } else if (deferred_sig_number_ == SIGTERM) {
-      call_signal_handler(old_sigterm_handler_, deferred_sig_number_);
-    }
-  }
-
-  static std::atomic_bool exit_;
-  static std::condition_variable wait_for_exit_cv_;
-  static SignalHandlerType old_sigint_handler_;
-  static SignalHandlerType old_sigterm_handler_;
-  static int deferred_sig_number_;
-  std::mutex wait_for_exit_mutex_;
+  inline static LegacyStop legacy_stop_;
 
   std::shared_ptr<rosbag2_transport::Recorder> recorder_;
+  mutable std::mutex node_mutex_;
   std::mutex spin_thread_mutex_;
   std::unique_ptr<rclcpp::executors::EventsCBGExecutor> exec_{nullptr};
   std::thread spin_thread_;
 };
-
-Recorder::SignalHandlerType Recorder::old_sigint_handler_ {SIG_ERR};
-Recorder::SignalHandlerType Recorder::old_sigterm_handler_ {SIG_ERR};
-int Recorder::deferred_sig_number_{-1};
-std::atomic_bool Recorder::exit_{false};
-std::condition_variable Recorder::wait_for_exit_cv_{};
 
 // Return a RecordOptions struct with defaults set for rewriting bags.
 rosbag2_transport::RecordOptions bag_rewrite_default_record_options()
@@ -851,7 +871,7 @@ rosbag2_transport::RecordOptions bag_rewrite_default_record_options()
 /// \brief Simple wrapper to read the input and output config YAML files into structs
 /// and call rosbag2_transport::bag_rewrite().
 void bag_rewrite(
-  const std::vector<rosbag2_storage::StorageOptions> & input_options,
+  const std::vector<py::object> & input_options,
   const std::string & input_config_file,
   const std::string & output_config_file)
 {
@@ -869,7 +889,7 @@ void bag_rewrite(
                              " input_options or input_config_file, but not both.");
   }
 
-  std::vector<rosbag2_storage::StorageOptions> effective_input_options = input_options;
+  auto effective_input_options = value_snapshots<rosbag2_storage::StorageOptions>(input_options);
 
   // Parse input options from YAML if provided
   if (has_input_config) {
@@ -925,7 +945,7 @@ void bag_rewrite(
 
 }  // namespace rosbag2_py
 
-PYBIND11_MODULE(_transport, m) {
+PYBIND11_MODULE(_transport, m, py::mod_gil_not_used()) {
   m.doc() = "Python wrapper of the rosbag2_transport API";
 
   // NOTE: it is non-trivial to add a constructor for PlayOptions and RecordOptions
@@ -934,28 +954,13 @@ PYBIND11_MODULE(_transport, m) {
   // the names of the members multiple times, as well as the default values from the struct
   // definitions.
 
-  py::class_<PlayOptions>(m, "PlayOptions")
+  py::class_<PlayOptions> play_options(m, "PlayOptions");
+  play_options
   .def(py::init<>())
-  .def_readwrite("read_ahead_queue_size", &PlayOptions::read_ahead_queue_size)
-  .def_readwrite("node_prefix", &PlayOptions::node_prefix)
-  .def_readwrite("rate", &PlayOptions::rate)
-  .def_readwrite("topics_to_filter", &PlayOptions::topics_to_filter)
-  .def_readwrite("services_to_filter", &PlayOptions::services_to_filter)
-  .def_readwrite("actions_to_filter", &PlayOptions::actions_to_filter)
-  .def_readwrite("regex_to_filter", &PlayOptions::regex_to_filter)
-  .def_readwrite("exclude_regex_to_filter", &PlayOptions::exclude_regex_to_filter)
-  .def_readwrite("exclude_topics_to_filter", &PlayOptions::exclude_topics_to_filter)
-  .def_readwrite("exclude_service_events_to_filter", &PlayOptions::exclude_services_to_filter)
-  .def_readwrite("exclude_actions_to_filter", &PlayOptions::exclude_actions_to_filter)
   .def_property(
     "topic_qos_profile_overrides",
     &PlayOptions::getTopicQoSProfileOverrides,
     &PlayOptions::setTopicQoSProfileOverrides)
-  .def_readwrite("loop", &PlayOptions::loop)
-  .def_readwrite("topic_remapping_options", &PlayOptions::topic_remapping_options)
-  .def_readwrite("clock_publish_frequency", &PlayOptions::clock_publish_frequency)
-  .def_readwrite("clock_publish_on_topic_publish", &PlayOptions::clock_publish_on_topic_publish)
-  .def_readwrite("clock_topics", &PlayOptions::clock_trigger_topics)
   .def_property(
     "delay",
     &PlayOptions::getDelay,
@@ -964,8 +969,6 @@ PYBIND11_MODULE(_transport, m) {
     "playback_duration",
     &PlayOptions::getPlaybackDuration,
     &PlayOptions::setPlaybackDuration)
-  .def_readwrite("disable_keyboard_controls", &PlayOptions::disable_keyboard_controls)
-  .def_readwrite("start_paused", &PlayOptions::start_paused)
   .def_property(
     "start_offset",
     &PlayOptions::getStartOffset,
@@ -974,15 +977,36 @@ PYBIND11_MODULE(_transport, m) {
     "playback_until_timestamp",
     &PlayOptions::getPlaybackUntilTimestamp,
     &PlayOptions::setPlaybackUntilTimestamp)
-  .def_readwrite("progress_bar_update_rate", &PlayOptions::progress_bar_update_rate)
-  .def_readwrite("progress_bar_separation_lines", &PlayOptions::progress_bar_separation_lines)
-  .def_readwrite("wait_acked_timeout", &PlayOptions::wait_acked_timeout)
-  .def_readwrite("disable_loan_message", &PlayOptions::disable_loan_message)
-  .def_readwrite("publish_service_requests", &PlayOptions::publish_service_requests)
-  .def_readwrite("send_actions_as_client", &PlayOptions::send_actions_as_client)
-  .def_readwrite("service_requests_source", &PlayOptions::service_requests_source)
-  .def_readwrite("message_order", &PlayOptions::message_order)
   ;
+  bind_field(play_options, "read_ahead_queue_size", &PlayOptions::read_ahead_queue_size);
+  bind_field(play_options, "node_prefix", &PlayOptions::node_prefix);
+  bind_field(play_options, "rate", &PlayOptions::rate);
+  bind_field(play_options, "topics_to_filter", &PlayOptions::topics_to_filter);
+  bind_field(play_options, "services_to_filter", &PlayOptions::services_to_filter);
+  bind_field(play_options, "actions_to_filter", &PlayOptions::actions_to_filter);
+  bind_field(play_options, "regex_to_filter", &PlayOptions::regex_to_filter);
+  bind_field(play_options, "exclude_regex_to_filter", &PlayOptions::exclude_regex_to_filter);
+  bind_field(play_options, "exclude_topics_to_filter", &PlayOptions::exclude_topics_to_filter);
+  bind_field(play_options, "exclude_service_events_to_filter",
+    &PlayOptions::exclude_services_to_filter);
+  bind_field(play_options, "exclude_actions_to_filter", &PlayOptions::exclude_actions_to_filter);
+  bind_field(play_options, "loop", &PlayOptions::loop);
+  bind_field(play_options, "topic_remapping_options", &PlayOptions::topic_remapping_options);
+  bind_field(play_options, "clock_publish_frequency", &PlayOptions::clock_publish_frequency);
+  bind_field(play_options, "clock_publish_on_topic_publish",
+    &PlayOptions::clock_publish_on_topic_publish);
+  bind_field(play_options, "clock_topics", &PlayOptions::clock_trigger_topics);
+  bind_field(play_options, "disable_keyboard_controls", &PlayOptions::disable_keyboard_controls);
+  bind_field(play_options, "start_paused", &PlayOptions::start_paused);
+  bind_field(play_options, "progress_bar_update_rate", &PlayOptions::progress_bar_update_rate);
+  bind_field(play_options, "progress_bar_separation_lines",
+    &PlayOptions::progress_bar_separation_lines);
+  bind_field(play_options, "wait_acked_timeout", &PlayOptions::wait_acked_timeout);
+  bind_field(play_options, "disable_loan_message", &PlayOptions::disable_loan_message);
+  bind_field(play_options, "publish_service_requests", &PlayOptions::publish_service_requests);
+  bind_field(play_options, "send_actions_as_client", &PlayOptions::send_actions_as_client);
+  bind_field(play_options, "service_requests_source", &PlayOptions::service_requests_source);
+  bind_field(play_options, "message_order", &PlayOptions::message_order);
 
   py::enum_<rosbag2_transport::ServiceRequestsSource>(m, "ServiceRequestsSource")
   .value("SERVICE_INTROSPECTION", rosbag2_transport::ServiceRequestsSource::SERVER_INTROSPECTION)
@@ -994,48 +1018,56 @@ PYBIND11_MODULE(_transport, m) {
   .value("SENT_TIMESTAMP", rosbag2_transport::MessageOrder::SENT_TIMESTAMP)
   ;
 
-  py::class_<RecordOptions>(m, "RecordOptions")
+  py::class_<RecordOptions> record_options(m, "RecordOptions");
+  record_options
   .def(py::init<>())
-  .def_readwrite("all_topics", &RecordOptions::all_topics)
-  .def_readwrite("is_discovery_disabled", &RecordOptions::is_discovery_disabled)
-  .def_readwrite("topics", &RecordOptions::topics)
-  .def_readwrite("static_topics_uri", &RecordOptions::static_topics_uri)
-  .def_readwrite("topic_types", &RecordOptions::topic_types)
-  .def_readwrite("exclude_topic_types", &RecordOptions::exclude_topic_types)
-  .def_readwrite("rmw_serialization_format", &RecordOptions::rmw_serialization_format)
-  .def_readwrite("input_serialization_format", &RecordOptions::input_serialization_format)
-  .def_readwrite("output_serialization_format", &RecordOptions::output_serialization_format)
-  .def_readwrite("topic_polling_interval", &RecordOptions::topic_polling_interval)
-  .def_readwrite("regex", &RecordOptions::regex)
-  .def_readwrite("exclude_regex", &RecordOptions::exclude_regex)
-  .def_readwrite("exclude_topics", &RecordOptions::exclude_topics)
-  .def_readwrite("exclude_service_events", &RecordOptions::exclude_service_events)
-  .def_readwrite("node_prefix", &RecordOptions::node_prefix)
-  .def_readwrite("compression_mode", &RecordOptions::compression_mode)
-  .def_readwrite("compression_format", &RecordOptions::compression_format)
-  .def_readwrite("compression_queue_size", &RecordOptions::compression_queue_size)
-  .def_readwrite("compression_threads", &RecordOptions::compression_threads)
-  .def_readwrite("compression_threads_priority", &RecordOptions::compression_threads_priority)
   .def_property(
     "topic_qos_profile_overrides",
     &RecordOptions::getTopicQoSProfileOverrides,
     &RecordOptions::setTopicQoSProfileOverrides)
-  .def_readwrite("include_hidden_topics", &RecordOptions::include_hidden_topics)
-  .def_readwrite("include_unpublished_topics", &RecordOptions::include_unpublished_topics)
-  .def_readwrite("start_paused", &RecordOptions::start_paused)
-  .def_readwrite("ignore_leaf_topics", &RecordOptions::ignore_leaf_topics)
-  .def_readwrite("use_sim_time", &RecordOptions::use_sim_time)
-  .def_readwrite("services", &RecordOptions::services)
-  .def_readwrite("all_services", &RecordOptions::all_services)
-  .def_readwrite("disable_keyboard_controls", &RecordOptions::disable_keyboard_controls)
-  .def_readwrite("actions", &RecordOptions::actions)
-  .def_readwrite("all_actions", &RecordOptions::all_actions)
-  .def_readwrite("exclude_actions", &RecordOptions::exclude_actions)
-  .def_readwrite("statistics_max_publishing_rate", &RecordOptions::statistics_max_publishing_rate)
-  .def_readwrite("repeat_transient_local_messages", &RecordOptions::repeat_transient_local_messages)
-  .def_readwrite("repeat_all_transient_local_depth",
-                 &RecordOptions::repeat_all_transient_local_depth)
   ;
+  bind_field(record_options, "all_topics", &RecordOptions::all_topics);
+  bind_field(record_options, "is_discovery_disabled", &RecordOptions::is_discovery_disabled);
+  bind_field(record_options, "topics", &RecordOptions::topics);
+  bind_field(record_options, "static_topics_uri", &RecordOptions::static_topics_uri);
+  bind_field(record_options, "topic_types", &RecordOptions::topic_types);
+  bind_field(record_options, "exclude_topic_types", &RecordOptions::exclude_topic_types);
+  bind_field(record_options, "rmw_serialization_format", &RecordOptions::rmw_serialization_format);
+  bind_field(record_options, "input_serialization_format",
+    &RecordOptions::input_serialization_format);
+  bind_field(record_options, "output_serialization_format",
+    &RecordOptions::output_serialization_format);
+  bind_field(record_options, "topic_polling_interval", &RecordOptions::topic_polling_interval);
+  bind_field(record_options, "regex", &RecordOptions::regex);
+  bind_field(record_options, "exclude_regex", &RecordOptions::exclude_regex);
+  bind_field(record_options, "exclude_topics", &RecordOptions::exclude_topics);
+  bind_field(record_options, "exclude_service_events", &RecordOptions::exclude_service_events);
+  bind_field(record_options, "node_prefix", &RecordOptions::node_prefix);
+  bind_field(record_options, "compression_mode", &RecordOptions::compression_mode);
+  bind_field(record_options, "compression_format", &RecordOptions::compression_format);
+  bind_field(record_options, "compression_queue_size", &RecordOptions::compression_queue_size);
+  bind_field(record_options, "compression_threads", &RecordOptions::compression_threads);
+  bind_field(record_options, "compression_threads_priority",
+    &RecordOptions::compression_threads_priority);
+  bind_field(record_options, "include_hidden_topics", &RecordOptions::include_hidden_topics);
+  bind_field(record_options, "include_unpublished_topics",
+    &RecordOptions::include_unpublished_topics);
+  bind_field(record_options, "start_paused", &RecordOptions::start_paused);
+  bind_field(record_options, "ignore_leaf_topics", &RecordOptions::ignore_leaf_topics);
+  bind_field(record_options, "use_sim_time", &RecordOptions::use_sim_time);
+  bind_field(record_options, "services", &RecordOptions::services);
+  bind_field(record_options, "all_services", &RecordOptions::all_services);
+  bind_field(record_options, "disable_keyboard_controls",
+    &RecordOptions::disable_keyboard_controls);
+  bind_field(record_options, "actions", &RecordOptions::actions);
+  bind_field(record_options, "all_actions", &RecordOptions::all_actions);
+  bind_field(record_options, "exclude_actions", &RecordOptions::exclude_actions);
+  bind_field(record_options, "statistics_max_publishing_rate",
+    &RecordOptions::statistics_max_publishing_rate);
+  bind_field(record_options, "repeat_transient_local_messages",
+    &RecordOptions::repeat_transient_local_messages);
+  bind_field(record_options, "repeat_all_transient_local_depth",
+    &RecordOptions::repeat_all_transient_local_depth);
 
   py::class_<rosbag2_py::Player>(m, "Player")
   // TODO(christophebedard): remove this constructor after a deprecation period
@@ -1074,8 +1106,12 @@ PYBIND11_MODULE(_transport, m) {
     )pbdoc")
 
   // Recommended constructor with multiple storage options
-  .def(py::init<const std::vector<rosbag2_storage::StorageOptions> &, const PlayOptions &,
-    const std::string &, const std::string &>(),
+  .def(py::init([](const std::vector<py::object> & storage_options,
+    const PlayOptions & play_options, const std::string & log_level, const std::string & node_name) {
+      return std::make_unique<rosbag2_py::Player>(
+        value_snapshots<rosbag2_storage::StorageOptions>(storage_options),
+        play_options.snapshot(), log_level, node_name);
+    }),
     py::arg("storage_options"),
     py::arg("play_options"),
     py::arg("log_level") = "info",
@@ -1238,7 +1274,7 @@ PYBIND11_MODULE(_transport, m) {
   // Deprecated play method with multiple storage options
   .def("play",
     [](rosbag2_py::Player & self,
-    const std::vector<rosbag2_storage::StorageOptions> & storage_options,
+    const std::vector<py::object> & storage_options,
     PlayOptions & play_options)
     {
       PyErr_WarnEx(PyExc_DeprecationWarning, "Player.play(storage_options_list, play_options) is "
