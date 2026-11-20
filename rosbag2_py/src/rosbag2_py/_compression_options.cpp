@@ -43,7 +43,9 @@ PYBIND11_MODULE(_compression_options, m, pybind11::mod_gil_not_used()) {
     pybind11::arg("compression_threads") = NativeOptions{}.compression_threads)
   .def_property(
     "compression_format",
-    [](const CompressionOptions & options) {return options.get(&NativeOptions::compression_format);},
+    [](const CompressionOptions & options) {
+      return options.get(&NativeOptions::compression_format);
+    },
     [](CompressionOptions & options, std::string value) {
       options.set(&NativeOptions::compression_format, std::move(value));
     })
